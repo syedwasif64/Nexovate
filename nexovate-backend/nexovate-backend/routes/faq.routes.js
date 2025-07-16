@@ -1,10 +1,8 @@
 // faq.routes.js
 const express = require('express');
 const router = express.Router();
+const faqController = require('../controllers/faq.controller');
 
-// Add your FAQ routes here later
-router.get('/', (req, res) => {
-  res.json({ message: "FAQ routes working" });
-});
+router.get('/', faqController.getFAQs);
 
 module.exports = router;

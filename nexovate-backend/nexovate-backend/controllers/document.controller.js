@@ -8,56 +8,82 @@ const questionService = require('../services/question.service');
 async function generatePDF(req, res) {
   try {
     const userId = req.user.UserID;
+    let textToGeneratePDF = null;
+    let imageTemplates = [];
+    let projectTitle = "Project Recommendation"; // Default title
+
+    // Fetch responses and templates first, as we need ProjectName from here
     const { responses, templates } = await questionService.getFinalizedResponsesWithTemplate(userId);
 
     if (!responses || responses.length === 0) {
       return res.status(400).json({ error: "Please finalize your questionnaire first." });
     }
 
-    const jsonInput = {
-      userId,
-      answers: responses.reduce((acc, r) => {
-        acc[r.QuestionText] = r.AnswerText;
-        return acc;
-      }, {}),
-      extraNotes: req.body.extraNotes || "",
-      imageLinks: templates.map(t => t.ImageURL)
-    };
+    // Extract ProjectName from the responses.
+    // The SQL SP should now include ProjectName in the first result set.
+    const projectNameResponse = responses.find(r => r.QuestionID === 1001); // Assuming 1001 is your project name QID
+    if (projectNameResponse && projectNameResponse.AnswerText) {
+      projectTitle = projectNameResponse.AnswerText;
+    }
 
-    const tmpFilePath = path.join(os.tmpdir(), `fyp_input_${userId}.json`);
-    fs.writeFileSync(tmpFilePath, JSON.stringify(jsonInput, null, 2), 'utf-8');
-
-    const pythonScriptPath = path.join(__dirname, '../../../ai-recommendation-test/generate_recommendation.py');
-    const pythonProcess = spawn('python', [pythonScriptPath, tmpFilePath]);
-
-    let stdout = '';
-    let stderr = '';
-
-    pythonProcess.stdout.on('data', (data) => { stdout += data.toString(); });
-    pythonProcess.stderr.on('data', (data) => { stderr += data.toString(); });
-
-    pythonProcess.on('close', async (code) => {
-      if (code !== 0) {
-        console.error('Python error:', stderr);
-        return res.status(500).json({ error: 'PDF generation failed', details: stderr });
+    // Option 1: Use refinedText passed directly in the body (highest priority)
+    if (req.body.refinedText) {
+      console.log("Generating PDF from text provided in request body.");
+      textToGeneratePDF = req.body.refinedText;
+      // If templates are explicitly provided in body, use them, otherwise use fetched templates
+      if (req.body.templates && Array.isArray(req.body.templates)) {
+        imageTemplates = req.body.templates.map(t => t.ImageURL);
+      } else {
+        imageTemplates = templates.map(t => t.ImageURL); // Use templates fetched from DB
       }
+    } else {
+      // Option 2: Try to get refined text from the database (most common scenario after draft/refinement)
+      textToGeneratePDF = await documentService.getUserRecommendationDraft(userId);
 
-      const pdfPath = stdout.trim();
-      if (!fs.existsSync(pdfPath)) {
-        return res.status(500).json({ error: 'PDF not found after generation' });
+      if (!textToGeneratePDF) {
+        // Option 3: If no refined text in DB, generate fresh from questionnaire answers
+        console.log("No refined text found in DB, generating fresh from questionnaire.");
+
+        const jsonInput = {
+          userId,
+          answers: responses.reduce((acc, r) => {
+            acc[r.QuestionText] = r.AnswerText;
+            return acc;
+          }, {}),
+          extraNotes: req.body.extraNotes || "",
+          imageLinks: templates.map(t => t.ImageURL)
+        };
+
+        // Call generateDraftText. This function now also saves the generated draft to the DB.
+        textToGeneratePDF = await documentService.generateDraftText(jsonInput);
+        imageTemplates = templates.map(t => t.ImageURL);
+      } else {
+        // If text was found in DB, use the templates fetched from the questionnaire service
+        console.log("Using refined text from DB.");
+        imageTemplates = templates.map(t => t.ImageURL);
       }
+    }
 
-      const pdfBuffer = fs.readFileSync(pdfPath);
-      const fileName = await documentService.saveGeneratedDocument(userId, pdfBuffer);
+    if (!textToGeneratePDF) {
+      return res.status(500).json({ error: "No text available to generate PDF." });
+    }
 
-      // ✅ Clear questionnaire & templates after successful generation
-      await questionService.clearUserData(userId);
+    const pdfBuffer = await documentService.generatePDFFromText(
+      textToGeneratePDF,
+      imageTemplates,
+      projectTitle // <--- Pass the extracted project title
+    );
 
-      res.json({
-        success: true,
-        fileName,
-        downloadUrl: `/documents/download/${fileName}`
-      });
+    const fileName = await documentService.saveGeneratedDocument(userId, pdfBuffer);
+
+    // >>> NEW: Clear user's questionnaire data after successful document generation <<<
+    await documentService.clearUserQuestionnaireData(userId);
+    // >>> END NEW <<<
+
+    res.json({
+      success: true,
+      fileName,
+      downloadUrl: `/documents/download/${fileName}`
     });
 
   } catch (error) {
@@ -96,8 +122,62 @@ async function listDocuments(req, res) {
   }
 }
 
+async function generateDraftText(req, res) {
+  try {
+    const userId = req.user.UserID;
+    const { responses, templates } = await questionService.getFinalizedResponsesWithTemplate(userId);
+
+    if (!responses || responses.length === 0) {
+      return res.status(400).json({ error: "Please finalize your questionnaire first." });
+    }
+
+    const jsonInput = {
+      userId,
+      answers: responses.reduce((acc, r) => {
+        acc[r.QuestionText] = r.AnswerText;
+        return acc;
+      }, {}),
+      extraNotes: req.body.extraNotes || "",
+      imageLinks: templates.map(t => t.ImageURL)
+    };
+
+    const rawText = await documentService.generateDraftText(jsonInput);
+
+    res.json({
+      success: true,
+      rawText
+    });
+  } catch (error) {
+    console.error('generateDraftText error:', error);
+    res.status(500).json({ error: 'Failed to generate draft text', details: error.message });
+  }
+}
+
+async function refineDraftText(req, res) {
+  try {
+    const { existingText, modifications } = req.body;
+    const userId = req.user.UserID;
+
+    const refinedText = await documentService.refineDraftText(
+      userId,
+      existingText,
+      modifications
+    );
+
+    res.json({
+      success: true,
+      refinedText
+    });
+  } catch (error) {
+    console.error('refineDraftText error:', error);
+    res.status(500).json({ error: 'Failed to refine draft', details: error.message });
+  }
+}
+
 module.exports = {
   generatePDF,
   downloadDocument,
-  listDocuments
+  listDocuments,
+  generateDraftText,
+  refineDraftText
 };

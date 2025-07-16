@@ -6,5 +6,7 @@ const { authenticate } = require('../middlewares/auth.middleware');
 router.post('/generate', authenticate, documentController.generatePDF);
 router.get('/download/:fileName', authenticate, documentController.downloadDocument);
 router.get('/', authenticate, documentController.listDocuments);
+router.post('/draft', authenticate, documentController.generateDraftText);
+router.post('/refine', authenticate, documentController.refineDraftText);
 
 module.exports = router;

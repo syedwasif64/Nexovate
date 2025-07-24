@@ -59,7 +59,7 @@ async function login(email, password) {
 
   return {
     token,
-    user: { UserID: user.UserID, email: user.Email }
+    user: { UserID: user.UserID, email: user.Email, fullName:user.FullName }
   };
 }
 
